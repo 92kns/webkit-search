@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -159,7 +160,32 @@ def stream_search(query: str, *, display: int, context_lines: int) -> StreamResu
                     raise RuntimeError(f"Search error: {msg}")
                 elif event == "done":
                     break
+    stale = _staleness(out.matches)
+    if stale:
+        out.alerts.append(stale)
     return out
+
+
+STALE_AFTER_HOURS = 24
+
+
+def _staleness(matches: list[dict[str, Any]]) -> str | None:
+    """Warn when Sourcegraph's mirror of the repo is more than a day old."""
+    stamps = [m["repoLastFetched"] for m in matches if m.get("repoLastFetched")]
+    if not stamps:
+        return None
+    try:
+        fetched = datetime.fromisoformat(max(stamps).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    hours = (datetime.now(UTC) - fetched).total_seconds() / 3600
+    if hours < STALE_AFTER_HOURS:
+        return None
+    age = f"{hours / 24:.1f} days" if hours >= 48 else f"{hours:.0f} hours"
+    return (
+        f"Sourcegraph index of {REPO} is {age} old; very recent code may be missing. "
+        "Line numbers match the commit in each result URL (use `cat --ref <commit>`)."
+    )
 
 
 def parse_content(match: dict[str, Any]) -> FileResult:
@@ -213,18 +239,84 @@ def parse_symbols(matches: list[dict[str, Any]]) -> list[Symbol]:
 # ---------------------------------------------------------------------------
 
 
-def fetch_file_contents(path: str, ref: str | None = None) -> list[str]:
+MAX_FILE_BYTES = 5 * 1024 * 1024
+LFS_POINTER = b"version https://git-lfs.github.com/spec/v1"
+
+
+def _safe_path(path: str) -> str:
+    """Normalize a repo-relative path; reject anything that could escape the repo."""
+    clean = path.strip().lstrip("/")
+    parts = clean.split("/")
+    if not clean or any(p in ("", ".", "..") for p in parts) or "\\" in clean:
+        raise RuntimeError(f"Invalid path: {path!r}")
+    return clean
+
+
+def _safe_ref(ref: str) -> str:
+    if ref.startswith("-") or ".." in ref or any(c.isspace() for c in ref):
+        raise RuntimeError(f"Invalid ref: {ref!r}")
+    return ref
+
+
+def _read_capped(resp: Any, what: str) -> bytes:
+    data = resp.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise RuntimeError(
+            f"{what} is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB"
+        )
+    return data
+
+
+def _github_raw(path: str, ref: str | None) -> bytes | None:
+    """Fetch from raw.githubusercontent.com. None means "try Sourcegraph instead"."""
+    if not REPO.startswith("github.com/"):
+        return None
+    owner_name = REPO.removeprefix("github.com/")
+    url = (
+        f"https://raw.githubusercontent.com/{urllib.parse.quote(owner_name)}/"
+        f"{urllib.parse.quote(ref or 'HEAD', safe='/')}/{urllib.parse.quote(path)}"
+    )
+    # Deliberately no auth headers: never send tokens to GitHub.
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return _read_capped(resp, path)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(f"File not found: {path} at {ref or 'main'}") from exc
+        return None
+    except (urllib.error.URLError, TimeoutError):
+        return None
+
+
+def _sourcegraph_raw(path: str, ref: str | None) -> bytes:
     rev = f"@{urllib.parse.quote(ref, safe='')}" if ref else ""
-    url = f"{ENDPOINT}/{REPO}{rev}/-/raw/{urllib.parse.quote(path.lstrip('/'))}"
+    url = f"{ENDPOINT}/{REPO}{rev}/-/raw/{urllib.parse.quote(path)}"
     req = urllib.request.Request(url, headers=_headers())
     try:
         with _open(req) as resp:
             ctype = resp.headers.get("Content-Type", "")
-            body = resp.read().decode("utf-8", "replace")
+            data = _read_capped(resp, path)
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"File not found: {path} at {ref or 'HEAD'}") from exc
-    if "text/html" in ctype and body.lstrip().lower().startswith("<!doctype"):
+    if "text/html" in ctype and data.lstrip()[:15].lower().startswith(b"<!doctype"):
         raise RuntimeError(f"File not found: {path} at {ref or 'HEAD'}")
+    return data
+
+
+def fetch_file_contents(path: str, ref: str | None = None) -> list[str]:
+    """File text from GitHub (always current), falling back to Sourcegraph."""
+    path = _safe_path(path)
+    if ref:
+        ref = _safe_ref(ref)
+    data = _github_raw(path, ref)
+    if data is None:
+        data = _sourcegraph_raw(path, ref)
+    if data.startswith(LFS_POINTER):
+        raise RuntimeError(f"{path} is a Git LFS pointer; the content isn't in git")
+    if b"\0" in data[:8192]:
+        raise RuntimeError(f"{path} looks like a binary file; not printing it")
+    body = data.decode("utf-8", "replace")
     if body.endswith("\n"):
         body = body[:-1]
     return body.split("\n")

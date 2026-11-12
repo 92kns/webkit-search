@@ -4,7 +4,9 @@
 - Backend is the public Sourcegraph API (sourcegraph.com)
   - Search: `GET /.api/search/stream` (SSE; `cm=t` chunk matches, `cl=N` context lines;
     chunk/line numbers are 0-based, symbol `line` is 1-based)
-  - cat: `GET /{repo}@{rev}/-/raw/{path}` (needs a non-default User-Agent, else 403)
+  - cat: GitHub `raw.githubusercontent.com/{owner/name}/{ref|HEAD}/{path}` first (fresh; never send auth),
+    fallback Sourcegraph `GET /{repo}@{rev}/-/raw/{path}` (needs a non-default User-Agent, else 403)
+  - Staleness: each match has `repoLastFetched`; `_staleness()` adds a note when it's over 24h old
   - ls: GraphQL `repository.commit.tree.entries`
 
 ## Dev commands

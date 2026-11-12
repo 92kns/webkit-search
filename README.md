@@ -2,8 +2,9 @@
 
 An agent friendly CLI for [WebKit source code](https://github.com/WebKit/WebKit).
 
-A single-file Python script with zero dependencies. Talks to the public
-[Sourcegraph](https://sourcegraph.com) API, which indexes `github.com/WebKit/WebKit`.
+A single-file Python script with zero dependencies. Search, symbols, find, and ls use the
+public [Sourcegraph](https://sourcegraph.com) API, which indexes `github.com/WebKit/WebKit`.
+`cat` reads straight from GitHub (always current) and falls back to Sourcegraph.
 
 ## Install
 
@@ -59,6 +60,20 @@ webkit-search ls Source/WebCore/layout
 | `SRC_ACCESS_TOKEN`   | (none)                      | Sourcegraph token; raises rate limits |
 | `SRC_ENDPOINT`       | `https://sourcegraph.com`   | Another Sourcegraph instance      |
 | `WEBKIT_SEARCH_REPO` | `github.com/WebKit/WebKit`  | Any repo that instance indexes    |
+
+## Freshness and line numbers
+
+Sourcegraph refreshes its copy of WebKit irregularly, sometimes a few days behind `main`. When
+the index is over a day old, results include a one-line `note:` on stderr. Search line numbers
+match the commit in each result's URL (also in `--json` output). Plain `cat` shows the latest
+`main`, so if line numbers matter, use `cat <path> --ref <commit-from-url>`.
+
+## Safety
+
+`cat` only fetches from `raw.githubusercontent.com/WebKit/WebKit/` (or the configured
+Sourcegraph instance). No credentials are sent to GitHub. Paths containing `..` and refs
+starting with `-` are rejected. Files over 5 MB, binary files, and Git LFS pointers are
+refused with a message instead of being printed.
 
 ## Limitations
 
