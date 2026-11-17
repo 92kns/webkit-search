@@ -1,5 +1,7 @@
 # webkit-search
 
+> **Moved:** this tool is now part of [engine-search](https://github.com/92kns/engine-search). Use `engine-search webkit ...`.
+
 An agent friendly CLI for [WebKit source code](https://github.com/WebKit/WebKit), and a single
 first stop for WebKit code questions.
 
