@@ -13,6 +13,8 @@ import itertools
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -21,6 +23,7 @@ import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -30,8 +33,11 @@ from typing import Any
 ENDPOINT = os.environ.get("SRC_ENDPOINT", "https://sourcegraph.com").rstrip("/")
 REPO = os.environ.get("WEBKIT_SEARCH_REPO", "github.com/WebKit/WebKit")
 TOKEN = os.environ.get("SRC_ACCESS_TOKEN", "")
-USER_AGENT = "webkit-search/0.1"
+USER_AGENT = "webkit-search/0.2"
 TIMEOUT = 60.0
+SEARCHFOX = os.environ.get("SEARCHFOX_URL", "https://searchfox.org").rstrip("/")
+SEARCHFOX_TREE = os.environ.get("SEARCHFOX_TREE", "wubkat")
+BACKEND = os.environ.get("WEBKIT_SEARCH_BACKEND", "auto")  # auto|searchfox|sourcegraph
 
 
 def _headers(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -98,6 +104,8 @@ class FileResult:
     path: str
     commit: str = ""
     snippets: list[Snippet] = field(default_factory=list)
+    label: str = ""  # searchfox section, e.g. "Definitions (WebCore::RenderBox)"
+    source: str = "sourcegraph"
 
 
 @dataclass
@@ -361,6 +369,126 @@ def fetch_tree(path: str, ref: str | None = None) -> list[tuple[str, bool]]:
 
 
 # ---------------------------------------------------------------------------
+# Searchfox client (fresh index of WebKit main, with semantic sections)
+# ---------------------------------------------------------------------------
+
+
+class SearchfoxUnavailable(Exception):
+    pass
+
+
+_SG_ONLY = re.compile(
+    r"(^|\s)-?(type|select|lang|repo|r|count|timeout|patterntype|rev|author|before"
+    r"|after|message|content|fork|archived|visibility):"
+    r"|(^|\s)(OR|AND|NOT)(\s|$)|(^|\s)-\S"
+)
+_FILE_TOKEN = re.compile(r"(?:^|\s)file:(\S+)")
+_CASE_TOKEN = re.compile(r"(?:^|\s)case:yes(?=\s|$)")
+
+
+def searchfox_plan(query: str) -> dict[str, Any] | None:
+    """Translate a query to searchfox parameters (None = only Sourcegraph can run it).
+
+    Searchfox handles: one bare term, one "quoted phrase", or one /regex/, plus at most
+    one plain or ^-anchored file: filter and case:yes. Everything else (multi-term AND,
+    OR/NOT, lang:, type:, regex file: filters) goes to Sourcegraph.
+    """
+    files = _FILE_TOKEN.findall(query)
+    if len(files) > 1:
+        return None
+    path = files[0] if files else ""
+    if path:
+        path = path.replace("\\.", ".").replace("\\/", "/")
+        if re.search(r"[\\*?\[\](){}|+$]", path.lstrip("^")):
+            return None
+    case = bool(_CASE_TOKEN.search(query))
+    rest = _CASE_TOKEN.sub(" ", _FILE_TOKEN.sub(" ", query)).strip()
+    if not rest or _SG_ONLY.search(rest):
+        return None
+    regexp = False
+    if len(rest) > 2 and rest.startswith("/") and rest.endswith("/"):
+        rest, regexp = rest[1:-1], True
+    elif len(rest) > 2 and rest.startswith('"') and rest.endswith('"'):
+        rest = rest[1:-1].replace('\\"', '"')
+    elif re.search(r"\s|\"", rest):
+        return None
+    return {"q": rest, "path": path, "case": case, "regexp": regexp}
+
+
+def _section_order(group: str) -> int:
+    return {"normal": 0, "test": 1, "generated": 2, "thirdparty": 3}.get(group, 4)
+
+
+def searchfox_search(plan: dict[str, Any]) -> list[FileResult]:
+    params = urllib.parse.urlencode(
+        {
+            "q": plan["q"],
+            "path": plan["path"],
+            "case": "true" if plan["case"] else "false",
+            "regexp": "true" if plan["regexp"] else "false",
+        }
+    )
+    req = urllib.request.Request(
+        f"{SEARCHFOX}/{SEARCHFOX_TREE}/search?{params}",
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise SearchfoxUnavailable(str(exc)) from exc
+    if data.get("*timedout*"):
+        raise SearchfoxUnavailable("searchfox query timed out")
+
+    files: list[FileResult] = []
+    seen: set[tuple[str, int]] = set()
+    groups = sorted(
+        ((g, v) for g, v in data.items() if isinstance(v, dict)),
+        key=lambda gv: _section_order(gv[0]),
+    )
+    for _group, sections in groups:
+        for label, hits in sections.items():
+            for hit in hits:
+                fr = FileResult(path=hit["path"], label=label, source="searchfox")
+                for ln in hit.get("lines", []):
+                    key = (hit["path"], int(ln["lno"]))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    start, end = (ln.get("bounds") or [0, 0])[:2]
+                    ranges = (
+                        [MatchRange(start, end)] if end > start else [MatchRange(0, 0)]
+                    )
+                    fr.snippets.append(
+                        Snippet(
+                            lines=[
+                                SnippetLine(
+                                    line_text=ln.get("line", ""),
+                                    line_number=int(ln["lno"]),
+                                    ranges=ranges,
+                                )
+                            ]
+                        )
+                    )
+                if fr.snippets:
+                    files.append(fr)
+    return files
+
+
+def searchfox_cli() -> str | None:
+    found = shutil.which("searchfox-cli")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".mozbuild" / "bin" / "searchfox-cli",
+        Path.home() / ".cargo" / "bin" / "searchfox-cli",
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Terminal output
 # ---------------------------------------------------------------------------
 
@@ -406,7 +534,9 @@ def progress(label: str) -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
-def line_url(path: str, line: int, commit: str = "") -> str:
+def line_url(path: str, line: int, commit: str = "", source: str = "") -> str:
+    if source == "searchfox":
+        return f"{SEARCHFOX}/{SEARCHFOX_TREE}/source/{path}#{line}"
     name = REPO.split("/", 1)[1] if REPO.startswith("github.com/") else None
     if name:
         return f"https://github.com/{name}/blob/{commit or 'main'}/{path}#L{line}"
@@ -419,7 +549,7 @@ def highlight_line(line: SnippetLine) -> str:
         return line.line_text
     result, pos = "", 0
     for r in sorted(line.ranges, key=lambda r: r.start):
-        if r.start < pos:
+        if r.start < pos or r.end <= r.start:
             continue
         result += line.line_text[pos : r.start]
         result += style(line.line_text[r.start : r.end], "bold", "red")
@@ -450,9 +580,13 @@ def format_grouped(files: list[FileResult], context: bool, limit: int) -> str:
         if not ln.ranges and not context:
             continue
         if f is not cur:
-            if cur is not None:
+            if cur is not None and (cur.path != f.path or cur.label != f.label):
                 out.append("")
-            out.append(style(f.path, "bold", "cyan"))
+            if cur is None or cur.path != f.path or cur.label != f.label:
+                header = style(f.path, "bold", "cyan")
+                if f.label:
+                    header += "  " + style(f"[{f.label}]", "dim")
+                out.append(header)
             cur, prev_si, prev_line = f, si, -1
         if si != prev_si and prev_line >= 0 and ln.line_number > prev_line + 1:
             out.append(style("    ...", "dim"))
@@ -503,10 +637,15 @@ def format_json(files: list[FileResult], fields: list[str], limit: int) -> str:
                 entry["context"] = [x.line_text for x in f.snippets[si].lines]
             elif fld == "matchRanges":
                 entry["matchRanges"] = [
-                    {"start": r.start, "end": r.end} for r in ln.ranges
+                    {"start": r.start, "end": r.end}
+                    for r in ln.ranges
+                    if r.end > r.start
                 ]
             elif fld == "url":
-                entry["url"] = line_url(f.path, ln.line_number, f.commit)
+                entry["url"] = line_url(f.path, ln.line_number, f.commit, f.source)
+        if f.label:
+            entry["kind"] = f.label
+        entry["source"] = f.source
         entries.append(entry)
     return json.dumps(entries, indent=2)
 
@@ -578,6 +717,23 @@ def run_search(
     json_fields: str | None,
     ref: str | None,
 ) -> None:
+    plan = None
+    if BACKEND != "sourcegraph" and not ref and not context_lines:
+        plan = searchfox_plan(query)
+        if plan is None and BACKEND == "searchfox":
+            _print_alerts(["query needs Sourcegraph syntax; searching Sourcegraph"])
+    if plan is not None:
+        try:
+            with progress("Searching (searchfox)..."):
+                sf_files = searchfox_search(plan)
+        except SearchfoxUnavailable as exc:
+            _print_alerts([f"searchfox unavailable ({exc}); using Sourcegraph"])
+        else:
+            if sf_files:
+                _emit_files(sf_files, limit, 0, json_fields, total=None, alerts=[])
+                return
+            _print_alerts(["no searchfox results; checking Sourcegraph (older index)"])
+
     with progress("Searching..."):
         res = stream_search(
             scoped_query(query, ref, limit),
@@ -593,10 +749,21 @@ def run_search(
         return
 
     files = [parse_content(m) for m in res.matches if m.get("type") == "content"]
+    _emit_files(files, limit, context_lines, json_fields, res.match_count, res.alerts)
+
+
+def _emit_files(
+    files: list[FileResult],
+    limit: int,
+    context_lines: int,
+    json_fields: str | None,
+    total: int | None,
+    alerts: list[str],
+) -> None:
     if not files:
         if json_fields is not None:
             sys.stdout.write("[]\n")
-        _print_alerts(res.alerts)
+        _print_alerts(alerts)
         sys.stderr.write("No results found\n")
         return
 
@@ -606,15 +773,15 @@ def run_search(
         sys.stdout.write(format_json(files, fields, limit) + "\n")
     elif STDOUT_IS_TTY:
         shown = min(count_matches(files), limit)
-        total = res.match_count
-        if total > shown:
-            sys.stderr.write(f"Showing {shown} of {total}+ results\n\n")
+        source = files[0].source
+        if total and total > shown:
+            sys.stderr.write(f"Showing {shown} of {total}+ results ({source})\n\n")
         else:
-            sys.stderr.write(f"Showing {shown} results\n\n")
+            sys.stderr.write(f"Showing {shown} results ({source})\n\n")
         sys.stdout.write(format_grouped(files, context_lines > 0, limit) + "\n")
     else:
         sys.stdout.write(format_flat(files, context_lines > 0, limit) + "\n")
-    _print_alerts(res.alerts)
+    _print_alerts(alerts)
 
 
 def run_other(matches: list[dict[str, Any]], *, json_out: bool) -> None:
@@ -645,21 +812,67 @@ def _print_symbol(s: Symbol) -> None:
     sys.stdout.write(f"{loc}  {style(s.kind, 'dim')} {container}{s.name}\n")
 
 
+def searchfox_symbols(name: str) -> list[Symbol]:
+    plan = searchfox_plan(name)
+    if plan is None:
+        return []
+    syms: list[Symbol] = []
+    for fr in searchfox_search(plan):
+        if not fr.label.startswith("Definitions ("):
+            continue
+        qualified = fr.label[len("Definitions (") : -1]
+        for sn in fr.snippets:
+            ln = sn.lines[0]
+            syms.append(Symbol(qualified, "definition", "", fr.path, ln.line_number))
+    return syms
+
+
 def run_sym(query: str, *, limit: int, kind: str | None, json_out: bool) -> None:
+    if BACKEND != "sourcegraph" and not kind:
+        try:
+            with progress("Searching symbols (searchfox)..."):
+                syms = searchfox_symbols(query)[:limit]
+        except SearchfoxUnavailable as exc:
+            _print_alerts([f"searchfox unavailable ({exc}); using Sourcegraph"])
+            syms = []
+        if syms:
+            _emit_symbols(syms, json_out, source="searchfox")
+            return
     q = f"type:symbol {query}"
     if kind:
         q += f" select:symbol.{kind}"
     with progress("Searching symbols..."):
         res = stream_search(
-            scoped_query(q, None, limit), display=limit * 3, context_lines=0
+            scoped_query(q, None, max(limit * 20, 200)),
+            display=max(limit * 20, 200),
+            context_lines=0,
         )
     syms = parse_symbols(res.matches)[:limit]
+    if not syms and kind and BACKEND != "sourcegraph":
+        try:
+            syms = searchfox_symbols(query)[:limit]
+        except SearchfoxUnavailable:
+            syms = []
+        if syms:
+            _print_alerts(
+                [
+                    f"Sourcegraph found no {kind} symbols; "
+                    "showing searchfox definitions (--kind not applied)"
+                ]
+            )
+            _emit_symbols(syms, json_out, source="searchfox")
+            return
     if not syms:
         if json_out:
             sys.stdout.write("[]\n")
         _print_alerts(res.alerts)
         sys.stderr.write("No results found\n")
         return
+    _emit_symbols(syms, json_out, source="sourcegraph")
+    _print_alerts(res.alerts)
+
+
+def _emit_symbols(syms: list[Symbol], json_out: bool, *, source: str) -> None:
     if json_out:
         rows = [
             {
@@ -668,7 +881,8 @@ def run_sym(query: str, *, limit: int, kind: str | None, json_out: bool) -> None
                 "container": s.container,
                 "path": s.path,
                 "line": s.line,
-                "url": line_url(s.path, s.line, s.commit),
+                "url": line_url(s.path, s.line, s.commit, source),
+                "source": source,
             }
             for s in syms
         ]
@@ -692,6 +906,28 @@ def run_find(query: str, *, limit: int) -> None:
         return
     for p in paths:
         sys.stdout.write(p + "\n")
+
+
+SEARCHFOX_CLI_COMMANDS = {
+    "define": "--define",
+    "calls-to": "--calls-to",
+    "calls-from": "--calls-from",
+    "field-layout": "--field-layout",
+}
+
+
+def run_searchfox_cli(command: str, arg: str, depth: int | None) -> None:
+    binary = searchfox_cli()
+    if not binary:
+        sys.exit(
+            f"`{command}` needs searchfox-cli for call graphs and definitions.\n"
+            "Install it with: cargo binstall searchfox-cli\n"
+            "            (or: cargo install searchfox-cli)"
+        )
+    argv = [binary, "-R", SEARCHFOX_TREE, SEARCHFOX_CLI_COMMANDS[command], arg]
+    if depth is not None and command.startswith("calls-"):
+        argv += ["--depth", str(depth)]
+    sys.exit(subprocess.run(argv, check=False).returncode)
 
 
 def run_cat(path: str, *, ref: str | None, number_lines: bool) -> None:
@@ -718,6 +954,10 @@ Usage: webkit-search [command] <query> [flags]
 Commands:
   search <query>   Search WebKit source code
   sym <name>       Find symbol definitions (classes, functions, ...)
+  define <sym>     Show a symbol's full definition       (needs searchfox-cli)
+  calls-to <sym>   Who calls this function               (needs searchfox-cli)
+  calls-from <sym> What this function calls              (needs searchfox-cli)
+  field-layout <C> C++ class memory layout               (needs searchfox-cli)
   find <name>      Find files by path
   cat <path>       Print file contents
   ls [dir]         List directory contents
@@ -730,6 +970,9 @@ Flags (search/sym/find):
       --json [fields]     JSON output (fields: path,line,snippet,context,
                           matchRanges,url)
       --kind <kind>       sym only: class, function, method, struct, enum, ...
+                          (uses Sourcegraph's symbol index)
+      --backend <b>       auto (default), searchfox, or sourcegraph
+      --depth <n>         calls-to/calls-from depth
 
 Flags (search/cat/ls):
       --ref <ref>         Git branch, tag, or commit (default: main)
@@ -739,7 +982,15 @@ Flags (all):
       --no-color          Disable colored output
   -h, --help              Show this help
 
+Backends:
+  Searches on main go to searchfox (searchfox.org/wubkat: fresh index, groups results
+  into Definitions/Declarations/Uses). Sourcegraph handles --ref, -C, multi-term or
+  OR/NOT queries, lang:/type: filters, regex file: filters, and --kind, and is the
+  fallback if searchfox fails or finds nothing. cat reads from GitHub.
+
 Environment:
+  WEBKIT_SEARCH_BACKEND   auto | searchfox | sourcegraph
+  SEARCHFOX_URL / SEARCHFOX_TREE   default https://searchfox.org / wubkat
   SRC_ACCESS_TOKEN        Sourcegraph token (optional; raises rate limits)
   SRC_ENDPOINT            Sourcegraph instance (default: https://sourcegraph.com)
   WEBKIT_SEARCH_REPO      Repo to search (default: github.com/WebKit/WebKit)
@@ -749,6 +1000,7 @@ Examples:
   webkit-search 'lang:c++ file:^Source/WebCore/css/ CSSValueID' -C 2
   webkit-search 'type:commit flexbox after:"2 weeks ago"'
   webkit-search sym RenderFlexibleBox --kind class
+  webkit-search calls-to 'WebCore::RenderBox::computeLogicalWidth' --depth 2
   webkit-search find RenderBox.h
   webkit-search cat Source/WebCore/rendering/RenderBox.h -n
   webkit-search cat Source/WTF/wtf/Vector.h --ref safari-7620-branch
@@ -764,6 +1016,8 @@ def main() -> None:
     parser.add_argument("--json", nargs="?", const="", default=None, dest="json_fields")
     parser.add_argument("--ref", default=None)
     parser.add_argument("--kind", default=None)
+    parser.add_argument("--backend", choices=["auto", "searchfox", "sourcegraph"])
+    parser.add_argument("--depth", type=int, default=None)
     parser.add_argument("-n", "--number", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
@@ -772,9 +1026,11 @@ def main() -> None:
     if opts.help:
         sys.stderr.write(USAGE)
         return
+    global USE_COLOR, BACKEND
     if opts.no_color:
-        global USE_COLOR
         USE_COLOR = False
+    if opts.backend:
+        BACKEND = opts.backend
 
     pos: list[str] = opts.args
     sub = pos[0] if pos else ""
@@ -782,6 +1038,10 @@ def main() -> None:
 
     if sub == "syntax":
         sys.stdout.write(SYNTAX_REFERENCE)
+    elif sub in SEARCHFOX_CLI_COMMANDS:
+        if not rest:
+            sys.exit(f"Usage: webkit-search {sub} <symbol>")
+        run_searchfox_cli(sub, rest, opts.depth)
     elif sub == "cat":
         if not rest:
             sys.exit("Usage: webkit-search cat <path> [--ref <ref>] [-n]")
